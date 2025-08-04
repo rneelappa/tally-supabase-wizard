@@ -1,47 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 import requests
 import xml.etree.ElementTree as ET
-import logging
-from typing import List, Dict, Any, Optional
-import uvicorn
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = FastAPI(
-    title="Tally Prime REST API",
-    description="REST API for accessing Tally Prime data",
-    version="1.0.0"
-)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI()
 
 TALLY_URL = "http://localhost:9000"  # Tally default URL
-
-def make_tally_request(xml_request: str) -> ET.Element:
-    """Make a request to Tally Prime and return parsed XML response"""
-    headers = {'Content-Type': 'application/xml'}
-    
-    try:
-        response = requests.post(TALLY_URL, data=xml_request.encode(), headers=headers, timeout=30)
-        response.raise_for_status()
-        return ET.fromstring(response.text)
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to connect to Tally Prime: {e}")
-        raise HTTPException(status_code=503, detail=f"Tally Prime connection failed: {str(e)}")
-    except ET.ParseError as e:
-        logger.error(f"Failed to parse Tally response: {e}")
-        raise HTTPException(status_code=500, detail=f"Invalid response from Tally Prime: {str(e)}")
 
 @app.get("/")
 def root():
@@ -54,7 +18,6 @@ def root():
             "/divisions", 
             "/ledgers",
             "/vouchers",
-            "/voucher-entries",
             "/health"
         ]
     }
@@ -88,7 +51,8 @@ def health_check():
         </ENVELOPE>
         """
         
-        root = make_tally_request(test_xml)
+        headers = {'Content-Type': 'application/xml'}
+        response = requests.post(TALLY_URL, data=test_xml.encode(), headers=headers)
         return {"status": "healthy", "tally_connection": "connected"}
     except Exception as e:
         return {"status": "unhealthy", "tally_connection": "disconnected", "error": str(e)}
@@ -111,7 +75,7 @@ def get_companies():
             <TDLMESSAGE>
               <COLLECTION NAME="List of Companies">
                 <TYPE>Company</TYPE>
-                <FETCH>NAME,GUID,EMAIL,STATE,PINCODE,PHONE,COMPANYNUMBER,ADDRESS,COUNTRY,CURRENCYNAME,BOOKSBEGINFROM,COMPANYNUMBER,FAXNUMBER,MOBILENUMBER,WEBSITE</FETCH>
+                <FETCH>NAME,GUID,EMAIL,STATE,PINCODE,PHONE,COMPANYNUMBER</FETCH>
               </COLLECTION>
             </TDLMESSAGE>
           </TDL>
@@ -120,28 +84,29 @@ def get_companies():
     </ENVELOPE>
     """
 
+    headers = {'Content-Type': 'application/xml'}
+
     try:
-        root = make_tally_request(xml_request)
+        response = requests.post(TALLY_URL, data=xml_request.encode(), headers=headers)
+        root = ET.fromstring(response.text)
+
         companies = []
-        
         for collection in root.iter("COLLECTION"):
             for comp in collection:
-                company_data = {}
-                for field in ["NAME", "GUID", "EMAIL", "STATE", "PINCODE", "PHONE", 
-                             "COMPANYNUMBER", "ADDRESS", "COUNTRY", "CURRENCYNAME", 
-                             "BOOKSBEGINFROM", "FAXNUMBER", "MOBILENUMBER", "WEBSITE"]:
-                    value = comp.findtext(field)
-                    if value:
-                        company_data[field.lower()] = value
-                
-                if company_data:  # Only add if we have data
-                    companies.append(company_data)
+                companies.append({
+                    "Name": comp.findtext("NAME"),
+                    "GUID": comp.findtext("GUID"),
+                    "Email": comp.findtext("EMAIL"),
+                    "State": comp.findtext("STATE"),
+                    "Pincode": comp.findtext("PINCODE"),
+                    "Phone": comp.findtext("PHONE"),
+                    "CompanyNumber": comp.findtext("COMPANYNUMBER")
+                })
 
-        return {"companies": companies, "count": len(companies)}
+        return JSONResponse(companies)
 
     except Exception as e:
-        logger.error(f"Error fetching companies: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch companies: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/divisions")
 def get_divisions():
@@ -170,27 +135,32 @@ def get_divisions():
     </ENVELOPE>
     """
 
+    headers = {'Content-Type': 'application/xml'}
+
     try:
-        root = make_tally_request(xml_request)
+        response = requests.post(TALLY_URL, data=xml_request.encode(), headers=headers)
+        root = ET.fromstring(response.text)
+
         divisions = []
-        
         for collection in root.iter("COLLECTION"):
             for div in collection:
-                division_data = {}
-                for field in ["NAME", "GUID", "PARENT", "ADDRESS", "PHONE", "EMAIL", 
-                             "CONTACTPERSON", "MOBILENUMBER", "FAXNUMBER", "WEBSITE"]:
-                    value = div.findtext(field)
-                    if value:
-                        division_data[field.lower()] = value
-                
-                if division_data:
-                    divisions.append(division_data)
+                divisions.append({
+                    "Name": div.findtext("NAME"),
+                    "GUID": div.findtext("GUID"),
+                    "Parent": div.findtext("PARENT"),
+                    "Address": div.findtext("ADDRESS"),
+                    "Phone": div.findtext("PHONE"),
+                    "Email": div.findtext("EMAIL"),
+                    "ContactPerson": div.findtext("CONTACTPERSON"),
+                    "MobileNumber": div.findtext("MOBILENUMBER"),
+                    "FaxNumber": div.findtext("FAXNUMBER"),
+                    "Website": div.findtext("WEBSITE")
+                })
 
-        return {"divisions": divisions, "count": len(divisions)}
+        return JSONResponse(divisions)
 
     except Exception as e:
-        logger.error(f"Error fetching divisions: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch divisions: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/ledgers")
 def get_ledgers():
@@ -219,28 +189,36 @@ def get_ledgers():
     </ENVELOPE>
     """
 
+    headers = {'Content-Type': 'application/xml'}
+
     try:
-        root = make_tally_request(xml_request)
+        response = requests.post(TALLY_URL, data=xml_request.encode(), headers=headers)
+        root = ET.fromstring(response.text)
+
         ledgers = []
-        
         for collection in root.iter("COLLECTION"):
             for ledger in collection:
-                ledger_data = {}
-                for field in ["NAME", "GUID", "PARENT", "OPENINGBALANCE", "CURRENTBALANCE", 
-                             "ADDRESS", "PHONE", "EMAIL", "CONTACTPERSON", "MOBILENUMBER", 
-                             "FAXNUMBER", "WEBSITE", "LEDGERFORMALNAME", "LEDGERTYPE"]:
-                    value = ledger.findtext(field)
-                    if value:
-                        ledger_data[field.lower()] = value
-                
-                if ledger_data:
-                    ledgers.append(ledger_data)
+                ledgers.append({
+                    "Name": ledger.findtext("NAME"),
+                    "GUID": ledger.findtext("GUID"),
+                    "Parent": ledger.findtext("PARENT"),
+                    "OpeningBalance": ledger.findtext("OPENINGBALANCE"),
+                    "CurrentBalance": ledger.findtext("CURRENTBALANCE"),
+                    "Address": ledger.findtext("ADDRESS"),
+                    "Phone": ledger.findtext("PHONE"),
+                    "Email": ledger.findtext("EMAIL"),
+                    "ContactPerson": ledger.findtext("CONTACTPERSON"),
+                    "MobileNumber": ledger.findtext("MOBILENUMBER"),
+                    "FaxNumber": ledger.findtext("FAXNUMBER"),
+                    "Website": ledger.findtext("WEBSITE"),
+                    "LedgerFormalName": ledger.findtext("LEDGERFORMALNAME"),
+                    "LedgerType": ledger.findtext("LEDGERTYPE")
+                })
 
-        return {"ledgers": ledgers, "count": len(ledgers)}
+        return JSONResponse(ledgers)
 
     except Exception as e:
-        logger.error(f"Error fetching ledgers: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch ledgers: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/vouchers")
 def get_vouchers():
@@ -260,7 +238,7 @@ def get_vouchers():
             <TDLMESSAGE>
               <COLLECTION NAME="List of Vouchers">
                 <TYPE>Voucher</TYPE>
-                <FETCH>VOUCHERNUMBER,VOUCHERTYPENAME,DATE,NARRATION,REFERENCE,AMOUNT,LEDGERENTRIES.LEDGERNAME,LEDGERENTRIES.ISDEEMEDPOSITIVE,LEDGERENTRIES.AMOUNT</FETCH>
+                <FETCH>VOUCHERNUMBER,VOUCHERTYPENAME,DATE,NARRATION,REFERENCE,AMOUNT</FETCH>
               </COLLECTION>
             </TDLMESSAGE>
           </TDL>
@@ -269,66 +247,29 @@ def get_vouchers():
     </ENVELOPE>
     """
 
+    headers = {'Content-Type': 'application/xml'}
+
     try:
-        root = make_tally_request(xml_request)
+        response = requests.post(TALLY_URL, data=xml_request.encode(), headers=headers)
+        root = ET.fromstring(response.text)
+
         vouchers = []
-        
         for collection in root.iter("COLLECTION"):
             for voucher in collection:
-                voucher_data = {}
-                for field in ["VOUCHERNUMBER", "VOUCHERTYPENAME", "DATE", "NARRATION", "REFERENCE", "AMOUNT"]:
-                    value = voucher.findtext(field)
-                    if value:
-                        voucher_data[field.lower()] = value
-                
-                # Handle ledger entries
-                ledger_entries = []
-                for entry in voucher.findall(".//LEDGERENTRIES"):
-                    entry_data = {}
-                    for field in ["LEDGERNAME", "ISDEEMEDPOSITIVE", "AMOUNT"]:
-                        value = entry.findtext(field)
-                        if value:
-                            entry_data[field.lower()] = value
-                    if entry_data:
-                        ledger_entries.append(entry_data)
-                
-                if ledger_entries:
-                    voucher_data["ledger_entries"] = ledger_entries
-                
-                if voucher_data:
-                    vouchers.append(voucher_data)
+                vouchers.append({
+                    "VoucherNumber": voucher.findtext("VOUCHERNUMBER"),
+                    "VoucherTypeName": voucher.findtext("VOUCHERTYPENAME"),
+                    "Date": voucher.findtext("DATE"),
+                    "Narration": voucher.findtext("NARRATION"),
+                    "Reference": voucher.findtext("REFERENCE"),
+                    "Amount": voucher.findtext("AMOUNT")
+                })
 
-        return {"vouchers": vouchers, "count": len(vouchers)}
+        return JSONResponse(vouchers)
 
     except Exception as e:
-        logger.error(f"Error fetching vouchers: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch vouchers: {str(e)}")
-
-@app.get("/metadata")
-def get_all_metadata():
-    """Get all metadata from Tally Prime in one request"""
-    try:
-        # Get all data
-        companies_response = get_companies()
-        divisions_response = get_divisions()
-        ledgers_response = get_ledgers()
-        vouchers_response = get_vouchers()
-        
-        return {
-            "companies": companies_response.get("companies", []),
-            "divisions": divisions_response.get("divisions", []),
-            "ledgers": ledgers_response.get("ledgers", []),
-            "vouchers": vouchers_response.get("vouchers", []),
-            "summary": {
-                "companies_count": companies_response.get("count", 0),
-                "divisions_count": divisions_response.get("count", 0),
-                "ledgers_count": ledgers_response.get("count", 0),
-                "vouchers_count": vouchers_response.get("count", 0)
-            }
-        }
-    except Exception as e:
-        logger.error(f"Error fetching all metadata: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch metadata: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000) 

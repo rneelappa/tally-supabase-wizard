@@ -9,7 +9,6 @@ import json
 import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime
-import threading
 import time
 
 # Configure logging
@@ -42,8 +41,7 @@ class TallyRESTClient:
         try:
             response = self.session.get(f"{self.base_url}/companies")
             response.raise_for_status()
-            data = response.json()
-            return data.get("companies", [])
+            return response.json()
         except Exception as e:
             logger.error(f"Failed to get companies: {e}")
             return []
@@ -53,8 +51,7 @@ class TallyRESTClient:
         try:
             response = self.session.get(f"{self.base_url}/divisions")
             response.raise_for_status()
-            data = response.json()
-            return data.get("divisions", [])
+            return response.json()
         except Exception as e:
             logger.error(f"Failed to get divisions: {e}")
             return []
@@ -64,8 +61,7 @@ class TallyRESTClient:
         try:
             response = self.session.get(f"{self.base_url}/ledgers")
             response.raise_for_status()
-            data = response.json()
-            return data.get("ledgers", [])
+            return response.json()
         except Exception as e:
             logger.error(f"Failed to get ledgers: {e}")
             return []
@@ -75,32 +71,10 @@ class TallyRESTClient:
         try:
             response = self.session.get(f"{self.base_url}/vouchers")
             response.raise_for_status()
-            data = response.json()
-            return data.get("vouchers", [])
+            return response.json()
         except Exception as e:
             logger.error(f"Failed to get vouchers: {e}")
             return []
-    
-    def get_all_metadata(self) -> Dict[str, Any]:
-        """Get all metadata from Tally in one request."""
-        try:
-            response = self.session.get(f"{self.base_url}/metadata")
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to get all metadata: {e}")
-            return {
-                "companies": [],
-                "divisions": [],
-                "ledgers": [],
-                "vouchers": [],
-                "summary": {
-                    "companies_count": 0,
-                    "divisions_count": 0,
-                    "ledgers_count": 0,
-                    "vouchers_count": 0
-                }
-            }
 
 
 class TallyMetadataExtractor:
@@ -169,23 +143,27 @@ class TallyMetadataExtractor:
     
     def get_all_metadata(self) -> Dict[str, Any]:
         """Get all metadata from Tally Prime."""
-        cache_key = "all_metadata"
-        if self._is_cache_valid(cache_key):
-            return self.cache[cache_key]
-        
-        metadata = self.client.get_all_metadata()
-        self._update_cache(cache_key, metadata)
-        return metadata
+        return {
+            "companies": self.get_companies(),
+            "divisions": self.get_divisions(),
+            "ledgers": self.get_ledgers(),
+            "vouchers": self.get_vouchers(),
+            "extracted_at": datetime.now().isoformat()
+        }
     
     def get_metadata_summary(self) -> Dict[str, int]:
         """Get a summary of metadata counts."""
-        metadata = self.get_all_metadata()
-        return metadata.get("summary", {
-            "companies_count": 0,
-            "divisions_count": 0,
-            "ledgers_count": 0,
-            "vouchers_count": 0
-        })
+        companies = self.get_companies()
+        divisions = self.get_divisions()
+        ledgers = self.get_ledgers()
+        vouchers = self.get_vouchers()
+        
+        return {
+            "companies_count": len(companies),
+            "divisions_count": len(divisions),
+            "ledgers_count": len(ledgers),
+            "vouchers_count": len(vouchers)
+        }
     
     def clear_cache(self):
         """Clear all cached data."""

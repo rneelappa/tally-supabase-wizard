@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-Supabase Configuration Page for Tally Tunnel Wizard
-Handles Supabase setup and data synchronization configuration.
+Supabase Configuration Page
+Handles Supabase connection and Tally data synchronization.
 """
 
-import sys
-import json
+import logging
 from typing import Dict, Any
-from pathlib import Path
 
 from PySide6.QtWidgets import (
-    QWizardPage, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QLabel, QLineEdit, QPushButton, QTextEdit, QProgressBar,
-    QGroupBox, QMessageBox, QCheckBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QSplitter, QWidget
+    QWizardPage, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, 
+    QLineEdit, QPushButton, QTextEdit, QProgressBar, QGroupBox, 
+    QMessageBox, QSplitter, QTableWidget, QTableWidgetItem, QHeaderView
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QThread, Signal
 
 from supabase_manager import SupabaseManager
+from tally_http_client import TallyHTTPClient
 from tally_supabase_sync import TallySupabaseSync
+
+logger = logging.getLogger(__name__)
 
 
 class SupabaseConnectionThread(QThread):
@@ -36,16 +35,10 @@ class SupabaseConnectionThread(QThread):
         """Test Supabase connection."""
         try:
             manager = SupabaseManager(self.project_url, self.api_key)
-            connected = manager.test_connection()
-            
-            if connected:
-                tables = manager.get_existing_tables()
-                message = f"Connected successfully! Found {len(tables)} existing tables."
+            if manager.test_connection():
+                self.connection_result.emit(True, "Connected successfully!")
             else:
-                message = "Connection failed. Please check your credentials."
-            
-            self.connection_result.emit(connected, message)
-            
+                self.connection_result.emit(False, "Connection failed")
         except Exception as e:
             self.connection_result.emit(False, f"Connection error: {str(e)}")
 
@@ -56,31 +49,47 @@ class TallyAnalysisThread(QThread):
     analysis_complete = Signal(dict)
     analysis_progress = Signal(str)
     
-    def __init__(self, supabase_url: str, supabase_key: str):
+    def __init__(self):
         super().__init__()
-        self.supabase_url = supabase_url
-        self.supabase_key = supabase_key
     
     def run(self):
         """Analyze Tally data structure."""
         try:
             self.analysis_progress.emit("Initializing Tally connection...")
-            sync = TallySupabaseSync(self.supabase_url, self.supabase_key)
             
-            self.analysis_progress.emit("Validating Tally connection...")
-            if not sync.validate_tally_connection():
+            # Create Tally client
+            tally_client = TallyHTTPClient()
+            
+            # Create sync instance with Tally client
+            sync = TallySupabaseSync(tally_client)
+            
+            self.analysis_progress.emit("Testing Tally connection...")
+            if not tally_client.test_connection():
                 self.analysis_complete.emit({'error': 'Tally connection failed'})
                 return
             
             self.analysis_progress.emit("Analyzing Tally data structure...")
-            structure = sync.analyze_tally_structure()
+            metadata = sync.analyze_tally_data()
             
-            self.analysis_progress.emit("Creating sync plan...")
-            plan = sync.preview_sync_plan(structure)
+            if "error" in metadata:
+                self.analysis_complete.emit({'error': metadata["error"]})
+                return
+            
+            self.analysis_progress.emit("Generating sync recommendations...")
+            recommendations = sync.get_sync_recommendations(metadata)
+            
+            self.analysis_progress.emit("Validating data quality...")
+            quality = sync.validate_data_quality(metadata)
+            
+            self.analysis_progress.emit("Preparing sync data...")
+            sync_data = sync.prepare_sync_data(metadata)
             
             result = {
-                'structure': structure,
-                'plan': plan,
+                'metadata': metadata,
+                'recommendations': recommendations,
+                'quality': quality,
+                'sync_data': sync_data,
+                'tally_client': tally_client,
                 'sync': sync
             }
             
@@ -96,22 +105,37 @@ class DataSyncThread(QThread):
     sync_progress = Signal(str)
     sync_complete = Signal(bool, str)
     
-    def __init__(self, sync: TallySupabaseSync, structure: dict, mapping: dict):
+    def __init__(self, supabase_manager: SupabaseManager, sync_data: dict):
         super().__init__()
-        self.sync = sync
-        self.structure = structure
-        self.mapping = mapping
+        self.supabase_manager = supabase_manager
+        self.sync_data = sync_data
     
     def run(self):
         """Sync data to Supabase."""
         try:
             self.sync_progress.emit("Starting data synchronization...")
-            success = self.sync.sync_data_to_supabase(self.structure, self.mapping)
             
-            if success:
-                self.sync_complete.emit(True, "Data synchronization completed successfully!")
+            # Sync each data type
+            total_synced = 0
+            
+            for data_type, data_list in self.sync_data.items():
+                if data_list and len(data_list) > 0:
+                    self.sync_progress.emit(f"Syncing {data_type} ({len(data_list)} records)...")
+                    
+                    # Create table name
+                    table_name = f"tally_{data_type}"
+                    
+                    # Sync to Supabase
+                    if self.supabase_manager.sync_tally_data({table_name: data_list}):
+                        total_synced += len(data_list)
+                        self.sync_progress.emit(f"✅ Synced {len(data_list)} {data_type}")
+                    else:
+                        self.sync_progress.emit(f"❌ Failed to sync {data_type}")
+            
+            if total_synced > 0:
+                self.sync_complete.emit(True, f"Data synchronization completed! Synced {total_synced} total records.")
             else:
-                self.sync_complete.emit(False, "Data synchronization failed. Check logs for details.")
+                self.sync_complete.emit(False, "No data was synced. Check logs for details.")
                 
         except Exception as e:
             self.sync_complete.emit(False, f"Sync error: {str(e)}")
@@ -126,9 +150,11 @@ class SupabaseConfigPage(QWizardPage):
         self.setSubTitle("Configure Supabase connection and manage Tally data synchronization.")
         
         self.supabase_manager = None
+        self.tally_client = None
         self.sync_manager = None
-        self.structure_data = None
-        self.sync_plan = None
+        self.metadata = None
+        self.recommendations = None
+        self.sync_data = None
         
         self.setup_ui()
     
@@ -167,70 +193,58 @@ class SupabaseConfigPage(QWizardPage):
         analysis_group = QGroupBox("Tally Data Analysis")
         analysis_layout = QVBoxLayout()
         
-        self.analyze_button = QPushButton("Analyze Tally Data Structure")
+        # Analysis button
+        self.analyze_button = QPushButton("Analyze Tally Data")
         self.analyze_button.clicked.connect(self.analyze_tally_data)
-        self.analyze_button.setEnabled(False)
         analysis_layout.addWidget(self.analyze_button)
         
-        self.analysis_progress = QLabel("Click 'Analyze Tally Data Structure' to start")
-        self.analysis_progress.setStyleSheet("color: gray;")
+        # Analysis progress
+        self.analysis_progress = QTextEdit()
+        self.analysis_progress.setMaximumHeight(150)
+        self.analysis_progress.setReadOnly(True)
         analysis_layout.addWidget(self.analysis_progress)
+        
+        # Analysis results
+        self.analysis_results = QTextEdit()
+        self.analysis_results.setMaximumHeight(200)
+        self.analysis_results.setReadOnly(True)
+        analysis_layout.addWidget(self.analysis_results)
         
         analysis_group.setLayout(analysis_layout)
         layout.addWidget(analysis_group)
         
-        # Sync Plan Group
-        self.sync_plan_group = QGroupBox("Synchronization Plan")
-        self.sync_plan_group.setVisible(False)
-        sync_plan_layout = QVBoxLayout()
-        
-        self.sync_plan_text = QTextEdit()
-        self.sync_plan_text.setMaximumHeight(150)
-        self.sync_plan_text.setReadOnly(True)
-        sync_plan_layout.addWidget(self.sync_plan_text)
+        # Sync Group
+        sync_group = QGroupBox("Data Synchronization")
+        sync_layout = QVBoxLayout()
         
         # Sync button
-        self.sync_button = QPushButton("Start Data Synchronization")
+        self.sync_button = QPushButton("Start Sync")
         self.sync_button.clicked.connect(self.start_sync)
         self.sync_button.setEnabled(False)
-        sync_plan_layout.addWidget(self.sync_button)
+        sync_layout.addWidget(self.sync_button)
         
-        self.sync_progress = QLabel("")
-        self.sync_progress.setStyleSheet("color: gray;")
-        sync_plan_layout.addWidget(self.sync_progress)
+        # Sync progress
+        self.sync_progress = QTextEdit()
+        self.sync_progress.setMaximumHeight(150)
+        self.sync_progress.setReadOnly(True)
+        sync_layout.addWidget(self.sync_progress)
         
-        self.sync_plan_group.setLayout(sync_plan_layout)
-        layout.addWidget(self.sync_plan_group)
-        
-        # Log Group
-        log_group = QGroupBox("Operation Log")
-        log_layout = QVBoxLayout()
-        
-        self.log_text = QTextEdit()
-        self.log_text.setMaximumHeight(200)
-        self.log_text.setReadOnly(True)
-        log_layout.addWidget(self.log_text)
-        
-        log_group.setLayout(log_layout)
-        layout.addWidget(log_group)
+        sync_group.setLayout(sync_layout)
+        layout.addWidget(sync_group)
         
         self.setLayout(layout)
     
     def test_connection(self):
         """Test Supabase connection."""
-        project_url = self.project_url_edit.text().strip()
-        api_key = self.api_key_edit.text().strip()
-        
-        if not project_url or not api_key:
-            QMessageBox.warning(self, "Missing Information", "Please enter both Project URL and API Key.")
-            return
-        
         self.test_connection_button.setEnabled(False)
         self.connection_status.setText("Testing...")
         self.connection_status.setStyleSheet("color: orange;")
         
         # Start connection test thread
-        self.connection_thread = SupabaseConnectionThread(project_url, api_key)
+        self.connection_thread = SupabaseConnectionThread(
+            self.project_url_edit.text(),
+            self.api_key_edit.text()
+        )
         self.connection_thread.connection_result.connect(self.on_connection_result)
         self.connection_thread.start()
     
@@ -241,157 +255,128 @@ class SupabaseConfigPage(QWizardPage):
         if connected:
             self.connection_status.setText("✅ Connected")
             self.connection_status.setStyleSheet("color: green;")
-            self.analyze_button.setEnabled(True)
             
-            # Store connection info
-            self.wizard().setProperty("supabase_url", self.project_url_edit.text().strip())
-            self.wizard().setProperty("supabase_key", self.api_key_edit.text().strip())
+            # Create Supabase manager
+            self.supabase_manager = SupabaseManager(
+                self.project_url_edit.text(),
+                self.api_key_edit.text()
+            )
+            
+            # Enable analysis button
+            self.analyze_button.setEnabled(True)
             
         else:
             self.connection_status.setText("❌ Failed")
             self.connection_status.setStyleSheet("color: red;")
-            self.analyze_button.setEnabled(False)
         
         self.log_message(message)
     
     def analyze_tally_data(self):
         """Analyze Tally data structure."""
-        supabase_url = self.project_url_edit.text().strip()
-        supabase_key = self.api_key_edit.text().strip()
-        
         self.analyze_button.setEnabled(False)
-        self.analysis_progress.setText("Analyzing...")
-        self.analysis_progress.setStyleSheet("color: orange;")
+        self.analysis_progress.clear()
+        self.analysis_results.clear()
         
         # Start analysis thread
-        self.analysis_thread = TallyAnalysisThread(supabase_url, supabase_key)
+        self.analysis_thread = TallyAnalysisThread()
         self.analysis_thread.analysis_progress.connect(self.on_analysis_progress)
         self.analysis_thread.analysis_complete.connect(self.on_analysis_complete)
         self.analysis_thread.start()
     
     def on_analysis_progress(self, message: str):
         """Handle analysis progress updates."""
-        self.analysis_progress.setText(message)
-        self.log_message(message)
+        self.analysis_progress.append(message)
+        
+        # Auto-scroll to bottom
+        scrollbar = self.analysis_progress.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
     
     def on_analysis_complete(self, result: Dict[str, Any]):
         """Handle analysis completion."""
         self.analyze_button.setEnabled(True)
         
-        if 'error' in result:
-            self.analysis_progress.setText(f"❌ Analysis failed: {result['error']}")
-            self.analysis_progress.setStyleSheet("color: red;")
-            self.log_message(f"Analysis failed: {result['error']}")
-        else:
-            self.analysis_progress.setText("✅ Analysis completed")
-            self.analysis_progress.setStyleSheet("color: green;")
-            
-            # Store results
-            self.structure_data = result['structure']
-            self.sync_plan = result['plan']
-            self.sync_manager = result['sync']
-            
-            # Show sync plan
-            self.show_sync_plan()
-            
-            self.log_message("Analysis completed successfully")
-    
-    def show_sync_plan(self):
-        """Display the synchronization plan."""
-        if not self.sync_plan:
+        if "error" in result:
+            self.analysis_results.append(f"❌ Analysis failed: {result['error']}")
             return
         
-        plan_text = "Synchronization Plan:\n\n"
+        # Store results
+        self.metadata = result['metadata']
+        self.recommendations = result['recommendations']
+        self.sync_data = result['sync_data']
+        self.tally_client = result['tally_client']
+        self.sync_manager = result['sync']
         
-        # Tables to create
-        if self.sync_plan['tables_to_create']:
-            plan_text += f"Tables to create: {', '.join(self.sync_plan['tables_to_create'])}\n"
+        # Display results
+        summary = self.metadata.get('summary', {})
+        self.analysis_results.append("📊 Analysis Results:")
+        self.analysis_results.append(f"  • Companies: {summary.get('total_companies', 0)}")
+        self.analysis_results.append(f"  • Groups: {summary.get('total_groups', 0)}")
+        self.analysis_results.append(f"  • Ledgers: {summary.get('total_ledgers', 0)}")
+        self.analysis_results.append(f"  • Divisions: {summary.get('total_divisions', 0)}")
+        self.analysis_results.append(f"  • Vouchers: {summary.get('total_vouchers', 0)}")
         
-        # Tables to update
-        if self.sync_plan['tables_to_update']:
-            plan_text += f"Tables to update: {', '.join(self.sync_plan['tables_to_update'])}\n"
+        # Show quality score
+        quality = result['quality']
+        if quality.get('valid', False):
+            self.analysis_results.append(f"  • Data Quality: ✅ Good ({quality.get('data_quality_score', 0)}%)")
+        else:
+            self.analysis_results.append(f"  • Data Quality: ⚠️ Issues found")
+            for issue in quality.get('issues', []):
+                self.analysis_results.append(f"    - {issue}")
         
-        plan_text += f"\nEstimated total records: {self.sync_plan['estimated_records']}\n\n"
-        
-        # Data summary
-        plan_text += "Data Summary:\n"
-        for table_name, info in self.sync_plan['data_summary'].items():
-            plan_text += f"  {table_name}: {info['record_count']} records from {info['source']}\n"
-        
-        self.sync_plan_text.setText(plan_text)
-        self.sync_plan_group.setVisible(True)
+        # Enable sync button
         self.sync_button.setEnabled(True)
     
     def start_sync(self):
         """Start data synchronization."""
-        if not self.sync_manager or not self.structure_data:
-            QMessageBox.warning(self, "No Data", "Please analyze Tally data first.")
-            return
-        
-        # Ask for confirmation
-        response = QMessageBox.question(
-            self, 
-            "Confirm Sync", 
-            f"This will sync {self.sync_plan['estimated_records']} records to Supabase. Continue?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
-        if response != QMessageBox.Yes:
+        if not self.supabase_manager or not self.sync_data:
+            QMessageBox.warning(self, "Error", "Please analyze Tally data first.")
             return
         
         self.sync_button.setEnabled(False)
-        self.sync_progress.setText("Synchronizing...")
-        self.sync_progress.setStyleSheet("color: orange;")
-        
-        # Create mapping
-        mapping = self.sync_manager.create_table_mapping(self.structure_data)
+        self.sync_progress.clear()
         
         # Start sync thread
-        self.sync_thread = DataSyncThread(self.sync_manager, self.structure_data, mapping)
+        self.sync_thread = DataSyncThread(self.supabase_manager, self.sync_data)
         self.sync_thread.sync_progress.connect(self.on_sync_progress)
         self.sync_thread.sync_complete.connect(self.on_sync_complete)
         self.sync_thread.start()
     
     def on_sync_progress(self, message: str):
         """Handle sync progress updates."""
-        self.sync_progress.setText(message)
-        self.log_message(message)
+        self.sync_progress.append(message)
+        
+        # Auto-scroll to bottom
+        scrollbar = self.sync_progress.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
     
     def on_sync_complete(self, success: bool, message: str):
         """Handle sync completion."""
         self.sync_button.setEnabled(True)
         
         if success:
-            self.sync_progress.setText("✅ Sync completed")
-            self.sync_progress.setStyleSheet("color: green;")
+            self.sync_progress.append(f"✅ {message}")
+            QMessageBox.information(self, "Success", message)
         else:
-            self.sync_progress.setText("❌ Sync failed")
-            self.sync_progress.setStyleSheet("color: red;")
-        
-        self.log_message(message)
-        
-        if success:
-            QMessageBox.information(self, "Success", "Data synchronization completed successfully!")
+            self.sync_progress.append(f"❌ {message}")
+            QMessageBox.warning(self, "Sync Failed", message)
     
     def log_message(self, message: str):
-        """Add message to log."""
-        timestamp = QTimer().remainingTime()  # Simple timestamp
-        self.log_text.append(f"[{timestamp}] {message}")
+        """Log a message to the analysis progress."""
+        self.analysis_progress.append(message)
         
         # Auto-scroll to bottom
-        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar = self.analysis_progress.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
     
     def validatePage(self) -> bool:
         """Validate the page before proceeding."""
-        # Check if connection is established
-        if not self.wizard().property("supabase_url"):
-            QMessageBox.warning(self, "Missing Configuration", "Please test and establish Supabase connection.")
+        if not self.supabase_manager:
+            QMessageBox.warning(self, "Validation Error", "Please test Supabase connection first.")
             return False
         
-        # Check if analysis is completed
-        if not self.structure_data:
-            QMessageBox.warning(self, "Missing Analysis", "Please analyze Tally data structure.")
+        if not self.metadata:
+            QMessageBox.warning(self, "Validation Error", "Please analyze Tally data first.")
             return False
         
         return True
@@ -401,12 +386,12 @@ def main():
     """Test the Supabase configuration page."""
     from PySide6.QtWidgets import QApplication
     
-    app = QApplication(sys.argv)
+    app = QApplication([])
     
     page = SupabaseConfigPage()
     page.show()
     
-    sys.exit(app.exec())
+    app.exec()
 
 
 if __name__ == "__main__":

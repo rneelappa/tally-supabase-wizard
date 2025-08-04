@@ -25,6 +25,7 @@ class SupabaseManager:
     def __init__(self, project_url: str, api_key: str):
         self.project_url = project_url.rstrip('/')
         self.api_key = api_key
+        # Use service_role key for admin operations to bypass RLS
         self.headers = {
             'apikey': api_key,
             'Authorization': f'Bearer {api_key}',
@@ -139,56 +140,61 @@ class SupabaseManager:
             return {}
     
     def create_table(self, table_name: str, columns: List[Dict[str, Any]]) -> bool:
-        """Create a new table in Supabase."""
+        """Create a new table in Supabase using SQL."""
         try:
-            # For Supabase, we'll try to insert a sample record to create the table structure
-            # This is a simplified approach - in production, you'd use Supabase's migration system
+            # For Supabase, we need to use the SQL API to create tables
+            # Since we can't directly execute SQL via REST API, we'll check if table exists
+            # and provide instructions for manual creation
             
-            # Create a sample record with the expected structure
-            sample_record = {}
+            # First, check if table already exists
+            response = requests.get(
+                f"{self.project_url}/rest/v1/{table_name}",
+                headers=self.headers,
+                params={'select': 'count'},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"Table {table_name} already exists")
+                return True
+            
+            # Table doesn't exist - generate SQL for manual creation
+            sql_columns = []
             for col in columns:
                 col_name = col['name']
                 col_type = col['type']
+                nullable = "NOT NULL" if col.get('nullable', True) == False else ""
+                default = f"DEFAULT {col['default']}" if 'default' in col else ""
                 
-                # Set default values based on type
-                if col_type == 'INTEGER':
-                    sample_record[col_name] = 0
-                elif col_type == 'NUMERIC':
-                    sample_record[col_name] = 0.0
-                elif col_type == 'BOOLEAN':
-                    sample_record[col_name] = False
-                elif col_type == 'TIMESTAMP WITH TIME ZONE':
-                    sample_record[col_name] = "2024-01-01T00:00:00Z"
-                else:
-                    sample_record[col_name] = ""
+                sql_columns.append(f"{col_name} {col_type} {nullable} {default}".strip())
             
-            # Try to insert the sample record
-            response = requests.post(
-                f"{self.project_url}/rest/v1/{table_name}",
-                headers=self.headers,
-                json=sample_record,
-                timeout=30
-            )
+            # Add standard Supabase columns
+            sql_columns.insert(0, "id UUID PRIMARY KEY DEFAULT gen_random_uuid()")
+            sql_columns.append("user_id UUID NOT NULL")
+            sql_columns.append("created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()")
+            sql_columns.append("updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()")
             
-            if response.status_code in [200, 201]:
-                logger.info(f"Table {table_name} structure created successfully")
-                
-                # Delete the sample record
-                if response.status_code == 201 and 'id' in response.json():
-                    delete_response = requests.delete(
-                        f"{self.project_url}/rest/v1/{table_name}",
-                        headers=self.headers,
-                        params={'id': 'eq.' + str(response.json()['id'])},
-                        timeout=10
-                    )
-                
-                return True
-            else:
-                logger.error(f"Failed to create table {table_name}: {response.status_code} - {response.text}")
-                return False
+            sql_statement = f"""
+            CREATE TABLE {table_name} (
+                {', '.join(sql_columns)}
+            );
+            
+            -- Enable RLS
+            ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY;
+            
+            -- Create RLS policy
+            CREATE POLICY "Users can view own data" ON {table_name}
+                FOR ALL USING (auth.uid() = user_id);
+            """
+            
+            logger.warning(f"Table {table_name} does not exist. Please create it manually in Supabase dashboard:")
+            logger.warning(f"SQL: {sql_statement}")
+            
+            # For now, return False to indicate table needs manual creation
+            return False
                 
         except Exception as e:
-            logger.error(f"Error creating table {table_name}: {e}")
+            logger.error(f"Error checking table {table_name}: {e}")
             return False
     
     def alter_table(self, table_name: str, columns: List[Dict[str, Any]]) -> bool:
@@ -248,10 +254,21 @@ class SupabaseManager:
                 logger.info(f"No data to insert for table {table_name}")
                 return True
             
+            # Use the actual user ID for RLS compliance
+            # User ID: faa3bf60-717e-4dd8-8159-e9dc1fe9b8d0
+            actual_user_id = "faa3bf60-717e-4dd8-8159-e9dc1fe9b8d0"
+            
+            # Prepare data with user_id
+            prepared_data = []
+            for record in data:
+                record_copy = record.copy()
+                record_copy['user_id'] = actual_user_id
+                prepared_data.append(record_copy)
+            
             # Insert in batches to avoid payload size limits
             batch_size = 100
-            for i in range(0, len(data), batch_size):
-                batch = data[i:i + batch_size]
+            for i in range(0, len(prepared_data), batch_size):
+                batch = prepared_data[i:i + batch_size]
                 
                 response = requests.post(
                     f"{self.project_url}/rest/v1/{table_name}",
@@ -261,7 +278,7 @@ class SupabaseManager:
                 )
                 
                 if response.status_code not in [200, 201]:
-                    logger.error(f"Failed to insert batch {i//batch_size + 1} for {table_name}: {response.status_code}")
+                    logger.error(f"Failed to insert batch {i//batch_size + 1} for {table_name}: {response.status_code} - {response.text}")
                     return False
                 
                 logger.info(f"Inserted batch {i//batch_size + 1} for {table_name}")
@@ -403,7 +420,7 @@ def main():
     """Test the Supabase manager."""
     # Test configuration
     project_url = "https://ppfwlhfehwelinfprviw.supabase.co"
-    api_key = "sb_secret_0ng3_U_wd2MXRyzPYXweuw_dDl-5EAA"
+    api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBwZndsaGZlaHdlbGluZnBydml3Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NDMxNzYxOCwiZXhwIjoyMDY5ODkzNjE4fQ._qiN-8ZAqg2Lz9TD2hENgCoKjEiFDFCafkymiDPRH7A"
     
     manager = SupabaseManager(project_url, api_key)
     
